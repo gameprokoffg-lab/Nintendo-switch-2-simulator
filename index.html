@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nintendo Switch 2 — симулятор стола</title>
+<meta name="description" content="Интерактивный 2D-симулятор Nintendo Switch 2 в браузере: покупка в Nintendo Shop, Wi-Fi, eShop, кастомные прошивки и игры прямо на столе.">
+<meta name="theme-color" content="#0b0d11">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<noscript><div class="noscript">Для симулятора нужен включённый JavaScript.</div></noscript>
+
+<div id="room">
+  <div id="stage">
+    <canvas id="scene" width="1600" height="900" aria-hidden="true"></canvas>
+    <div id="handheldSlot" class="screenSlot"></div>
+    <div id="tvSlot" class="screenSlot"></div>
+  </div>
+</div>
+
+<!-- переключение столов -->
+<button id="deskTab" type="button" aria-label="Перейти к другому столу">
+  <span class="deskTab-arrow">‹</span>
+  <span class="deskTab-label">другой стол</span>
+</button>
+
+<!-- ярлык стола -->
+<div id="deskName" class="deskName"><span class="dot"></span><span id="deskNameText">Стол у окна</span></div>
+
+<!-- подсказки -->
+<button id="helpBtn" type="button" aria-expanded="false" aria-controls="helpPanel">?</button>
+<aside id="helpPanel" class="helpPanel" hidden>
+  <h2>Как это работает</h2>
+  <div class="helpKbd">
+    <span>Управление с клавиатуры</span>
+    <button id="kbdToggle" type="button" aria-pressed="true">Отключить</button>
+  </div>
+  <div class="helpKbd" id="devRow" hidden>
+    <span>Дев-мод</span>
+    <button id="devBtn" type="button">Показать логи</button>
+  </div>
+  <div class="helpKbd">
+    <span>Прогресс консоли</span>
+    <button id="wipeBtn" type="button">Стереть прогресс</button>
+  </div>
+  <ol>
+    <li><b>Телефон</b> — кнопка в правом нижнем углу. В «Магазине» покупается Wi-Fi роутер, в «Nintendo Shop» — консоль, картриджи и мануал.</li>
+    <li><b>Коробки</b> приезжают на стол у окна. Кликните по коробке, чтобы открыть; пустую коробку перетащите в мусорку в левом нижнем углу.</li>
+    <li><b>Роутер</b>: зажмите ПКМ, перетащите на стену и отпустите. На стене появятся логин и пароль Wi-Fi.</li>
+    <li><b>Кнопка питания</b> — тонкая полоска сверху корпуса. Наведите курсор: подсветится хитбокс, нажмите — консоль включится.</li>
+    <li><b>Joy-Con 2</b> — тяните за корпус: магниты отпускают, джойкон падает с физикой. Или нажмите кнопку снятия у верхнего края.</li>
+    <li><b>Кнопки на джойконах</b> работают: стик, крестовина, A/B/X/Y, L/R, ZL/ZR, +/−, Home, C, Capture, SL/SR.</li>
+    <li><b>Стрелка слева</b> — второй стол: док-станция, телевизор и грип.</li>
+    <li><b>Док-режим</b>: снимите джойконы → вставьте их в грип → опустите консоль в док → протяните HDMI от дока к телевизору.</li>
+    <li><b>Game Loader</b> на консоли: перетащите туда файл игры — на столе появится картридж. Вставьте его в консоль, игра попадёт в библиотеку.</li>
+    <li><b>Клик по экрану консоли</b> — приблизить. <b>Esc</b> или клик мимо экрана — отъехать.</li>
+    <li><b>Ящик стола</b>: нажмите на ручку, чтобы открыть. Мануал можно положить в ящик и достать обратно.</li>
+  </ol>
+</aside>
+
+<!-- телефон -->
+<button id="phoneBtn" class="phoneBtn" type="button" aria-label="Открыть телефон" aria-expanded="false">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><rect x="6" y="2.5" width="12" height="19" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="18.4" r="1.1" fill="currentColor"/><rect x="9" y="4.6" width="6" height="1.1" rx=".55" fill="currentColor" opacity=".55"/></svg>
+</button>
+<div id="phone" class="phone" hidden>
+  <div class="phoneScreen">
+    <div class="phoneTop"><span data-ph-clock>12:00</span><span data-ph-status>Wi-Fi: нет</span></div>
+    <div class="phoneHome" data-ph-home></div>
+    <div class="phoneApp" data-ph-app hidden></div>
+  </div>
+  <div class="phoneBar"><button type="button" data-ph-close>Закрыть</button></div>
+</div>
+
+<!-- мануал -->
+<div id="manual" class="manual" hidden>
+  <div class="manBook">
+    <div class="manPage" data-man-page></div>
+    <div class="manBar">
+      <button type="button" data-man-prev aria-label="Предыдущая страница">‹</button>
+      <span class="manNum" data-man-num>1 / 1</span>
+      <button type="button" data-man-next aria-label="Следующая страница">›</button>
+      <button type="button" class="manClose" data-man-close>Закрыть</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<div id="bootVeil" class="bootVeil"><span>кликните, чтобы включить звук</span></div>
+
+<script src="dev_mode.js"></script>
+<script src="js/util.js"></script>
+<script src="js/seed.js"></script>
+<script src="js/store.js"></script>
+<script src="js/supabase.js"></script>
+<script src="js/firmware-default.js"></script>
+<script src="js/nebula-runtime.js"></script>
+<script src="js/world.js"></script>
+<script src="js/os.js"></script>
+<script src="js/games.js"></script>
+<script src="js/games-pack.js"></script>
+<script src="js/life.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
