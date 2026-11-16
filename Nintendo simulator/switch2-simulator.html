@@ -548,7 +548,7 @@ body{
 <script>'use strict';
 
 /* 1 — дев-мод включён, 0 — выключен */
-window.DEV_MODE = 1;
+window.DEV_MODE = 0;
 
 window.Dev = (() => {
   const enabled = Number(window.DEV_MODE) === 1;
@@ -1254,6 +1254,9 @@ var Store = (() => {
     }, item);
     data.net.published.unshift(pub);
     save();
+    if (window.SupabaseSync && window.SupabaseSync.submitPublication) {
+      window.SupabaseSync.submitPublication(pub);
+    }
     return { ok: true, item: pub };
   }
 
@@ -1331,6 +1334,209 @@ var Store = (() => {
   };
 })();
 </script>
+<script>// ============================================================
+// Supabase-синк для Nintendo Switch 2 симулятора
+// Публичные данные: лидерборд рекордов + eShop-публикации.
+// Offline-first: локальная очередь, синк при появлении сети.
+// REST (PostgREST) через fetch — без библиотек и CDN.
+// ============================================================
+(function () {
+  var CONFIG = {
+    url: 'https://xhbeanrnyeplutsuytph.supabase.co',
+    anon: 'sb_publishable_FQPfZbyIz93sOC3X4pS8AA_Fe2yFh3W',
+    tableRecords: 'records',
+    tablePublications: 'publications',
+    // максимально долго ждём сеть, чтобы не тормозить офлайн-запуск
+    offlineMs: 2500,
+  };
+
+  var enabled = false;   // true после первого успешного соединения (и если есть сеть)
+  var queueKey = 'switch2.supabase.queue';  // очередь публикаций, отложенных офлайн
+  var pending = {};      // { 'records:tetris': true } защита от дублей в рамках сессии
+
+  function localStorageOk() { return typeof localStorage !== 'undefined'; }
+  function readQueue() {
+    if (!localStorageOk()) return [];
+    try { var r = JSON.parse(localStorage.getItem(queueKey) || '[]'); return Array.isArray(r) ? r : []; }
+    catch (e) { return []; }
+  }
+  function writeQueue(q) { if (localStorageOk()) { try { localStorage.setItem(queueKey, JSON.stringify(q)); } catch (e) {} } }
+
+  // Есть ли вообще сеть судя по браузеру
+  function online() { return typeof navigator !== 'undefined' ? navigator.onLine !== false : true; }
+
+  function timeout(ms) {
+    return new Promise(function (resolve) {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  // Базовый REST-запрос к PostgREST
+  function request(path, opts) {
+    opts = opts || {};
+    var headers = {
+      apikey: CONFIG.anon,
+      Authorization: 'Bearer ' + CONFIG.anon,
+      'Content-Type': 'application/json',
+    };
+    if (opts.headers) for (var k in opts.headers) headers[k] = opts.headers[k];
+
+    return fetch(CONFIG.url + '/rest/v1/' + path, {
+      method: opts.method || 'GET',
+      headers: headers,
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+    }).then(function (res) {
+      if (!res.ok) return res.text().then(function (t) { throw new Error('HTTP ' + res.status + ': ' + t.slice(0, 160)); });
+      if (opts.expectNoBody) return null;
+      var ct = res.headers.get('content-type') || '';
+      return ct.indexOf('json') >= 0 ? res.json() : res.text();
+    });
+  }
+
+  // Быстрая проверка доступности (один лёгкий GET)
+  function check() {
+    if (!online()) { enabled = false; return Promise.resolve(false); }
+    return request(CONFIG.tableRecords + '?select=id&limit=1')
+      .then(function () { enabled = true; return true; })
+      .catch(function () { enabled = false; return false; });
+  }
+
+  // ---------- Лидерборд ----------
+  function topRecords(game, limit) {
+    limit = limit || 10;
+    return request(CONFIG.tableRecords + '?game=eq.' + game + '&order=score.asc,id.asc&limit=' + limit);
+  }
+
+  // Отправить рекорд. score: для конца (тетрис/сердце/штурм) — очки, больше лучше;
+  // для гонок (isTime) — миллисекунды, меньше лучше. очередь офлайн-записей.
+  function submitRecord(rec) {
+    rec = rec || {};
+    var name = String(rec.player || 'Игрок').slice(0, 24);
+    var game = String(rec.game || 'tetris');
+    var isTime = !!rec.time;
+    var score = Number(rec.score || 0);
+    var entry = {
+      game: game,
+      player: name,
+      score: score,
+      is_time: isTime,
+      user_id: rec.userId || null,
+    };
+    return enqueueAndSend('records', entry);
+  }
+
+  // ---------- eShop-публикации ----------
+  function submitPublication(pub) {
+    if (!pub || !pub.id) return Promise.resolve({ ok: false, error: 'Нет id' });
+    var entry = {
+      id: String(pub.id),
+      author: String(pub.author || 'Аноним').slice(0, 40),
+      name: String(pub.name || 'Без названия').slice(0, 80),
+      kind: String(pub.kind || 'demo').slice(0, 20),
+      desc: String(pub.desc || '').slice(0, 500),
+      created_at: Number(pub.createdAt || Date.now()),
+    };
+    return enqueueAndSend('publications', entry);
+  }
+
+  // Общая отправка с локальной очередью
+  function enqueueAndSend(table, entry) {
+    var key = table + ':' + JSON.stringify(entry);
+    if (pending[key]) return Promise.resolve({ ok: true, queued: true });
+    pending[key] = true;
+
+    // Если браузер говорит, что сеть есть — пробуем отправить сразу.
+    // При любой ошибке (нет доступа, RLS, выключена сеть) — кладём в локальную
+    // очередь и вернёмся позже. Это и есть offline-first.
+    if (online()) {
+      return sendToServer(table, entry)
+        .then(function () { enabled = true; return { ok: true }; })
+        .catch(function () { pushLocal(table, entry); return { ok: true, queued: true, offline: true }; });
+    }
+    // сети нет — откладываем
+    pushLocal(table, entry);
+    return Promise.resolve({ ok: true, queued: true, offline: true });
+  }
+
+  function sendToServer(table, entry) {
+    if (table === 'records') {
+      // upsert по (game, score, player) — чтобы не плодить дубли при повторном синке
+      return request(CONFIG.tableRecords + '?on_conflict=game,score,player', {
+        method: 'POST',
+        body: entry,
+        headers: { Prefer: 'resolution=ignore-duplicates,return=minimal' },
+        expectNoBody: true,
+      });
+    }
+    // publications upsert по id
+    return request(CONFIG.tablePublications + '?on_conflict=id', {
+      method: 'POST',
+      body: entry,
+      headers: { Prefer: 'resolution=ignore-duplicates,return=minimal' },
+      expectNoBody: true,
+    });
+  }
+
+  function pushLocal(table, entry) {
+    var q = readQueue();
+    q.push({ table: table, entry: entry });
+    // ограничим очередь, чтобы не расти без сети
+    if (q.length > 500) q = q.slice(q.length - 500);
+    writeQueue(q);
+  }
+
+  function flushQueue() {
+    if (!online()) return Promise.resolve();
+    var q = readQueue();
+    if (!q.length) return Promise.resolve();
+    writeQueue([]); // убрали из очереди — если что-то упадёт, не зациклимся
+
+    var seq = Promise.resolve();
+    q.forEach(function (item) {
+      seq = seq.then(function () { return sendToServer(item.table, item.entry).catch(function () { return null; }); });
+    });
+    return seq;
+  }
+
+  function sync() {
+    if (!online()) return Promise.resolve(false);
+    return check().then(function (up) {
+      if (!up) return false;
+      return flushQueue().then(function () { return true; });
+    });
+  }
+
+  // ---------- подключение к событию сети ----------
+  function onVisibleOrOnline() {
+    if (!online()) return;
+    // один раз на старте пробуем, дальше только по событию + при показе
+    sync().catch(function () {});
+  }
+
+  if (typeof window !== 'undefined') {
+    if (window.addEventListener) {
+      window.addEventListener('online', onVisibleOrOnline);
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'visible') onVisibleOrOnline();
+      });
+    }
+  }
+
+  // Первый холодный синк (не блокирует загрузку игры)
+  setTimeout(function () { onVisibleOrOnline(); }, 800);
+
+  window.SupabaseSync = {
+    config: CONFIG,
+    enabled: function () { return enabled; },
+    check: check,
+    sync: sync,
+    topRecords: topRecords,
+    submitRecord: submitRecord,
+    submitPublication: submitPublication,
+    flushQueue: flushQueue,
+    online: online,
+  };
+})();</script>
 <script>'use strict';
 
 /* =====================================================================
@@ -6710,6 +6916,17 @@ var GamePack = (function () {
   const W = 1280, H = 720;
   const registry = [];
 
+  // Отправка рекорда в публичный лидерборд Supabase (offline-safe).
+  function pushRecord(game, score, time) {
+    if (!time && !(score > 0)) return;          // не засоряем нолями
+    if (!window.SupabaseSync) return;
+    let player = 'Игрок';
+    try {
+      if (window.Store && Store.current) { const acc = Store.current(); if (acc && acc.login) player = acc.login; }
+    } catch (e) {}
+    SupabaseSync.submitRecord({ game, player, score, time });
+  }
+
   function add(meta) {
     registry.push(meta);
   }
@@ -7229,6 +7446,7 @@ var GamePack = (function () {
         g.best = Math.max(g.best, g.score);
         writeJson('switch2.tetris.best', g.best);
         menu.addCoins(4 + Math.floor(g.score / 1200));
+        pushRecord('tetris', g.score, false);
       }
       if (g.next.length < 3) g.next.push(takeName());
     }
@@ -7857,6 +8075,7 @@ var GamePack = (function () {
           g.newRecord = g.board[0] === g.raceTime;
           Sfx.ok();
           menu.addCoins(g.newRecord ? 25 : 10);
+          pushRecord('race', Math.round(g.raceTime), true);
         } else {
           Sfx.ok();
         }
@@ -9025,6 +9244,7 @@ var GamePack = (function () {
         progress.unlocked = Math.max(progress.unlocked, Math.min(FOES.length - 1, g.foeI + 1));
         if (window.Nebula) Nebula.save('heart.save', progress);
         menu.addCoins(8);
+        pushRecord('heart', progress.done.filter(Boolean).length, false);
       }
       Sfx.ok();
     }
@@ -9913,6 +10133,7 @@ var GamePack = (function () {
         g.newBest = true;
         writeJson('switch2.doom.best', g.best);
       }
+      pushRecord('doom', g.score, false);
       Sfx.ok();
     }
 
