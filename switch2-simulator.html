@@ -6,6 +6,7 @@
 <title>Nintendo Switch 2 — симулятор стола</title>
 <meta name="description" content="Интерактивный 2D-симулятор Nintendo Switch 2 в браузере: покупка в Nintendo Shop, Wi-Fi, eShop, кастомные прошивки и игры прямо на столе.">
 <meta name="theme-color" content="#0b0d11">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://xhbeanrnyeplutsuytph.supabase.co wss://xhbeanrnyeplutsuytph.supabase.co; object-src 'none'; base-uri 'self'; form-action 'self'">
 <style>*,*::before,*::after{box-sizing:border-box}
 :root{
   --ink:#080a0d;
@@ -548,7 +549,7 @@ body{
 <script>'use strict';
 
 /* 1 — дев-мод включён, 0 — выключен */
-window.DEV_MODE = 0;
+window.DEV_MODE = 1;
 
 window.Dev = (() => {
   const enabled = Number(window.DEV_MODE) === 1;
@@ -1272,6 +1273,23 @@ var Store = (() => {
 
   function published() { return clone(data.net.published); }
 
+  // Слить публикации, пришедшие из Supabase, в локальный список.
+  // Локальные с тем же id не перезаписываем; новые добавляем (свои — уже есть).
+  function mergePublished(remote) {
+    if (!Array.isArray(remote) || !remote.length) return;
+    const existing = new Set(data.net.published.map((p) => p.id));
+    let changed = false;
+    for (const p of remote) {
+      if (p && p.id && !existing.has(p.id)) {
+        data.net.published.push(p);
+        existing.add(p.id);
+        changed = true;
+      }
+    }
+    if (changed) save();
+    return changed;
+  }
+
   function accounts() { return clone(data.net.accounts); }
 
   /* ------------------------------ файл ------------------------------ */
@@ -1328,7 +1346,7 @@ var Store = (() => {
     unlocked, setUnlocked, firmwareText, setFirmware, fwSetting, fwSettings,
     battery, setBattery, memory,
     saveLibrary, library, nextSeq,
-    publish, unpublish, published, accounts,
+    publish, unpublish, published, mergePublished, accounts,
     exportData, importData, factoryReset, resetProgress,
     on,
   };
@@ -1365,15 +1383,16 @@ var Store = (() => {
   // Есть ли вообще сеть судя по браузеру
   function online() { return typeof navigator !== 'undefined' ? navigator.onLine !== false : true; }
 
-  function timeout(ms) {
-    return new Promise(function (resolve) {
-      setTimeout(resolve, ms);
-    });
+  // Дев-лог: пишем и в журнал дев-мода, и в консоль браузера.
+  function log(msg) {
+    try { if (window.Dev && Dev.log) Dev.log('Supabase: ' + msg); } catch (e) {}
+    try { if (window.console && console.log) console.log('[supabase] ' + msg); } catch (e) {}
   }
 
-  // Базовый REST-запрос к PostgREST
+  // Базовый REST-запрос к PostgREST. Логирует каждый шаг и не висит вечно.
   function request(path, opts) {
     opts = opts || {};
+    var method = opts.method || 'GET';
     var headers = {
       apikey: CONFIG.anon,
       Authorization: 'Bearer ' + CONFIG.anon,
@@ -1381,24 +1400,52 @@ var Store = (() => {
     };
     if (opts.headers) for (var k in opts.headers) headers[k] = opts.headers[k];
 
+    var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, CONFIG.requestMs || 9000) : null;
+    var started = Date.now();
+    log('→ ' + method + ' ' + path);
+
     return fetch(CONFIG.url + '/rest/v1/' + path, {
-      method: opts.method || 'GET',
+      method: method,
       headers: headers,
       body: opts.body ? JSON.stringify(opts.body) : undefined,
+      signal: ctrl ? ctrl.signal : undefined,
     }).then(function (res) {
-      if (!res.ok) return res.text().then(function (t) { throw new Error('HTTP ' + res.status + ': ' + t.slice(0, 160)); });
-      if (opts.expectNoBody) return null;
+      var ms = Date.now() - started;
+      if (timer) clearTimeout(timer);
+      if (!res.ok) {
+        log('✗ ' + method + ' ' + path + ' → HTTP ' + res.status + ' за ' + ms + ' мс');
+        return res.text().then(function (t) {
+          log('✗ ответ сервера: ' + String(t).slice(0, 200));
+          throw new Error('HTTP ' + res.status + ': ' + t.slice(0, 160));
+        });
+      }
+      if (opts.expectNoBody) {
+        log('✓ ' + method + ' ' + path + ' → ' + res.status + ' за ' + ms + ' мс');
+        return null;
+      }
       var ct = res.headers.get('content-type') || '';
-      return ct.indexOf('json') >= 0 ? res.json() : res.text();
+      var parsed = ct.indexOf('json') >= 0 ? res.json() : res.text();
+      return parsed.then(function (data) {
+        var n = Array.isArray(data) ? data.length + ' строк' : 'ok';
+        log('✓ ' + method + ' ' + path + ' → ' + res.status + ', ' + n + ', ' + ms + ' мс');
+        return data;
+      });
+    }).catch(function (err) {
+      if (timer) clearTimeout(timer);
+      var m = String((err && err.message) || err);
+      if (err && err.name === 'AbortError') log('✗ таймаут запроса: ' + method + ' ' + path);
+      else if (m.indexOf('HTTP ') !== 0) log('✗ сеть: ' + method + ' ' + path + ' — ' + m);
+      throw err;
     });
   }
 
   // Быстрая проверка доступности (один лёгкий GET)
   function check() {
-    if (!online()) { enabled = false; return Promise.resolve(false); }
+    if (!online()) { enabled = false; log('проверка: браузер считает, что сети нет'); return Promise.resolve(false); }
     return request(CONFIG.tableRecords + '?select=id&limit=1')
-      .then(function () { enabled = true; return true; })
-      .catch(function () { enabled = false; return false; });
+      .then(function () { enabled = true; log('проверка: соединение OK'); return true; })
+      .catch(function () { enabled = false; log('проверка: соединения нет'); return false; });
   }
 
   // ---------- Лидерборд ----------
@@ -1428,15 +1475,65 @@ var Store = (() => {
   // ---------- eShop-публикации ----------
   function submitPublication(pub) {
     if (!pub || !pub.id) return Promise.resolve({ ok: false, error: 'Нет id' });
+    // Храним ПОЛНЫЙ объект публикации в jsonb-колонке data, чтобы скачивание
+    // игры из eShop работало (нужны code, sizeMB, img, menuImg, section и т.д.).
     var entry = {
       id: String(pub.id),
       author: String(pub.author || 'Аноним').slice(0, 40),
       name: String(pub.name || 'Без названия').slice(0, 80),
-      kind: String(pub.kind || 'demo').slice(0, 20),
-      description: String(pub.desc || '').slice(0, 500),
+      section: String(pub.section || 'games').slice(0, 20),
       created_at: Number(pub.createdAt || Date.now()),
+      data: pub,
     };
     return enqueueAndSend('publications', entry);
+  }
+
+  // Подтянуть все публикации из базы (для отображения в eShop).
+  function fetchPublications() {
+    if (!online()) { log('публикации: браузер считает, что сети нет — пропуск'); return Promise.resolve([]); }
+    log('публикации: загружаю из базы…');
+    return request(CONFIG.tablePublications + '?select=*&order=created_at.desc')
+      .then(function (rows) {
+        rows = Array.isArray(rows) ? rows : [];
+        var full = 0;
+        for (var i = 0; i < rows.length; i++) {
+          var d = rows[i] && rows[i].data;
+          if (d && typeof d === 'object' && Object.keys(d).length) full++;
+        }
+        log('публикации: получено ' + rows.length + ', с полными данными (data): ' + full);
+        if (rows.length && full < rows.length) {
+          log('публикации: у ' + (rows.length - full) + ' записей нет data — запустите миграцию из supabase.sql (alter table … add column data)');
+        }
+        return rows.map(function (r) {
+          var o = (r.data && typeof r.data === 'object') ? r.data : {};
+          return Object.assign({}, o, {
+            id: r.id,
+            author: r.author,
+            name: r.name,
+            createdAt: r.created_at,
+          });
+        });
+      })
+      .catch(function (e) {
+        log('публикации: ОШИБКА — ' + (e && e.message || e));
+        return [];
+      });
+  }
+
+  // Общий pull: загрузить публикации и слить в локальный eShop.
+  // reason — откуда вызвано: boot | account | eshop | sync.
+  function pullAll(reason) {
+    reason = reason || 'manual';
+    if (!online()) { log('pull(' + reason + '): сети нет — пропуск'); return Promise.resolve([]); }
+    log('pull(' + reason + '): старт');
+    return fetchPublications().then(function (list) {
+      var merged = false;
+      try {
+        if (window.Store && Store.mergePublished) merged = Store.mergePublished(list);
+      } catch (e) { log('pull(' + reason + '): ошибка слияния — ' + (e && e.message || e)); }
+      log('pull(' + reason + '): получено ' + list.length + ', новых в eShop: ' + (merged ? 'да' : 'нет'));
+      return list;
+    });
   }
 
   // Общая отправка с локальной очередью
@@ -1449,12 +1546,18 @@ var Store = (() => {
     // При любой ошибке (нет доступа, RLS, выключена сеть) — кладём в локальную
     // очередь и вернёмся позже. Это и есть offline-first.
     if (online()) {
+      log('отправка в ' + table + ': пробую сейчас…');
       return sendToServer(table, entry)
-        .then(function () { enabled = true; return { ok: true }; })
-        .catch(function () { pushLocal(table, entry); return { ok: true, queued: true, offline: true }; });
+        .then(function () { enabled = true; log('отправка в ' + table + ': OK'); return { ok: true }; })
+        .catch(function (e) {
+          pushLocal(table, entry);
+          log('отправка в ' + table + ': не вышло (' + (e && e.message || e) + ') — в очередь');
+          return { ok: true, queued: true, offline: true };
+        });
     }
     // сети нет — откладываем
     pushLocal(table, entry);
+    log('отправка в ' + table + ': сети нет — в очередь');
     return Promise.resolve({ ok: true, queued: true, offline: true });
   }
 
@@ -1468,11 +1571,11 @@ var Store = (() => {
         expectNoBody: true,
       });
     }
-    // publications upsert по id
+    // publications: merge-duplicates — повторная публикация обновит data
     return request(CONFIG.tablePublications + '?on_conflict=id', {
       method: 'POST',
       body: entry,
-      headers: { Prefer: 'resolution=ignore-duplicates,return=minimal' },
+      headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
       expectNoBody: true,
     });
   }
@@ -1483,6 +1586,7 @@ var Store = (() => {
     // ограничим очередь, чтобы не расти без сети
     if (q.length > 500) q = q.slice(q.length - 500);
     writeQueue(q);
+    log('очередь: ' + q.length + ' записей');
   }
 
   function flushQueue() {
@@ -1499,10 +1603,13 @@ var Store = (() => {
   }
 
   function sync() {
-    if (!online()) return Promise.resolve(false);
+    if (!online()) { log('sync: сети нет — пропуск'); return Promise.resolve(false); }
+    log('sync: старт');
     return check().then(function (up) {
       if (!up) return false;
-      return flushQueue().then(function () { return true; });
+      return flushQueue()
+        .then(function () { return pullAll('sync'); })
+        .then(function () { log('sync: готово'); return true; });
     });
   }
 
@@ -1533,6 +1640,8 @@ var Store = (() => {
     topRecords: topRecords,
     submitRecord: submitRecord,
     submitPublication: submitPublication,
+    fetchPublications: fetchPublications,
+    pullAll: pullAll,
     flushQueue: flushQueue,
     online: online,
   };
@@ -5166,7 +5275,7 @@ const OS = (() => {
     Sfx.ok();
     if (a.id === 'library') { focus = 0; show('library'); renderLibrary(); return; }
     if (a.id === 'loader') { show('loader'); renderLoaderList(); return; }
-    if (a.id === 'shop') { shopFocus = 0; show('shop'); renderShop(); return; }
+    if (a.id === 'shop') { showShop(); return; }
     if (a.id === 'settings') { focus = 0; show('settings'); renderSettings(); return; }
     startGame(a.id);
   }
@@ -5798,6 +5907,7 @@ var SwitchGame = {
     show('home');
     focus = 0;
     renderHome(true);
+    pullCloud('account');
     flashText(welcomeMode === 'register' ? 'Аккаунт «' + login + '» создан' : 'С возвращением, ' + login);
   }
 
@@ -5839,6 +5949,21 @@ var SwitchGame = {
     shopFocus = 0;
     show('shop');
     renderShop();
+    pullRemotePubs();
+  }
+
+  // Подтянуть публикации других игроков из Supabase и показать их в eShop.
+  function pullRemotePubs() {
+    if (!window.SupabaseSync || !SupabaseSync.pullAll) return;
+    SupabaseSync.pullAll('eshop').then((list) => {
+      if (list && list.length && layer === 'shop') renderShop();
+    }).catch(() => {});
+  }
+
+  // Подтянуть публичное из базы при загрузке сайта и входе в аккаунт.
+  function pullCloud(where) {
+    if (!window.SupabaseSync || !SupabaseSync.pullAll) return;
+    SupabaseSync.pullAll(where).catch(() => {});
   }
 
   function sectionLabel(id) {
@@ -6211,6 +6336,7 @@ var SwitchGame = {
   }
 
   function openAccountModal() {
+    pullCloud('account');
     const acc = Store.current();
     const others = Store.accounts().filter((a) => !acc || a.login !== acc.login);
     const html = '<div class="accList">' + (others.length
@@ -6244,6 +6370,7 @@ var SwitchGame = {
           userbar();
           applyFirmware();
           goHome();
+          pullCloud('account');
           flashText('Вы вошли как ' + login);
         } },
       ],
@@ -6396,6 +6523,7 @@ var SwitchGame = {
         busy = false;
         applyFirmware();
         userbar();
+        pullCloud('boot');
         if (!Store.current()) {
           showWelcome('register');
         } else {

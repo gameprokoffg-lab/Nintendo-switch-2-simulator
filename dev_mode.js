@@ -1,7 +1,7 @@
 'use strict';
 
 /* 1 — дев-мод включён, 0 — выключен */
-window.DEV_MODE = 0;
+window.DEV_MODE = 1;
 
 window.Dev = (() => {
   const enabled = Number(window.DEV_MODE) === 1;
